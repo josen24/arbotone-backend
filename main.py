@@ -285,17 +285,23 @@ def deposit(wallet: str, payload: DepositPayload):
 
     wallet = wallet.lower()
     now_iso = datetime.now(timezone.utc).isoformat()
+    today = hoy_str()
 
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         asegurar_inversor_existe(cur, wallet)
 
+        # IMPORTANTE: al depositar, marcamos last_accrual_day = hoy.
+        # Esto evita que el rendimiento (positivo o negativo) generado
+        # ANTES del deposito se le aplique al capital recien ingresado.
+        # El inversor empieza a acumular rendimiento recien desde manana.
         cur.execute("""
             UPDATE investors
             SET capital = capital + %s,
-                joined_at = COALESCE(joined_at, %s)
+                joined_at = COALESCE(joined_at, %s),
+                last_accrual_day = %s
             WHERE wallet = %s;
-        """, (payload.amount, now_iso, wallet))
+        """, (payload.amount, now_iso, today, wallet))
 
         cur.execute("""
             INSERT INTO investor_deposits (wallet, amount, tx_hash, ts)
