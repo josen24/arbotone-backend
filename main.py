@@ -314,6 +314,7 @@ def status():
         "losses": row.get("losses"),
         "daily_return_pct_investor": row.get("daily_return_pct_investor", 0.0),
         "last_update": row.get("last_update_iso"),
+        "extra": row.get("extra"),
     }
 
 
