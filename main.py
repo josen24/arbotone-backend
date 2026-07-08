@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import psycopg2
 import psycopg2.extras
+from web3 import Web3
 
 app = FastAPI(title="ArbitragePool Backend")
 
@@ -61,6 +62,92 @@ if not DATABASE_URL:
         "Falta la variable de entorno DATABASE_URL. "
         "Configúrala en Railway con la connection string de Neon."
     )
+
+
+# ────────────────────────────────────────────────────────────
+#  Verificación on-chain de depósitos (BSC — USDT BEP-20)
+# ────────────────────────────────────────────────────────────
+BSC_RPC          = os.getenv("BSC_RPC", "https://bsc-dataseed1.binance.org/")
+POOL_WALLET      = os.getenv("POOL_WALLET", "0xb1F9217BB122F9A35995a73c5C9274Bc80BeD7D4").lower()
+USDT_BEP20_ADDR  = os.getenv("USDT_BEP20_ADDR", "0x55d398326f99059fF775485246999027B3197955")
+MIN_CONFIRMACIONES = int(os.getenv("MIN_CONFIRMACIONES", "3"))
+TOLERANCIA_MONTO_PCT = 0.02  # 2% de tolerancia entre lo declarado y lo real on-chain
+
+# ABI mínimo: solo lo necesario para leer decimals() y el evento Transfer
+ERC20_ABI_MINIMO = [
+    {"constant": True, "inputs": [], "name": "decimals",
+     "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+]
+TRANSFER_EVENT_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+
+_w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+_usdt_contract = _w3.eth.contract(address=Web3.to_checksum_address(USDT_BEP20_ADDR), abi=ERC20_ABI_MINIMO)
+_usdt_decimals_cache = None
+
+
+def _obtener_decimales_usdt() -> int:
+    global _usdt_decimals_cache
+    if _usdt_decimals_cache is None:
+        _usdt_decimals_cache = _usdt_contract.functions.decimals().call()
+    return _usdt_decimals_cache
+
+
+def verificar_deposito_onchain(tx_hash: str, monto_declarado: float) -> dict:
+    """Verifica en la blockchain de BSC que la transacción:
+      1) existe y fue exitosa,
+      2) tiene suficientes confirmaciones,
+      3) es una transferencia de USDT (BEP-20) hacia la wallet del pool,
+      4) el monto coincide (con tolerancia) con lo que el usuario declaró.
+    Devuelve {"ok": bool, "motivo": str, "monto_real": float}. El monto_real
+    (leído de la blockchain) es el que se acredita, nunca el que el usuario
+    declaró — así no importa si el frontend manda un número incorrecto.
+    """
+    try:
+        tx_hash = tx_hash.strip()
+        if not tx_hash.startswith("0x") or len(tx_hash) != 66:
+            return {"ok": False, "motivo": "El hash de transacción no tiene el formato correcto", "monto_real": 0.0}
+
+        receipt = _w3.eth.get_transaction_receipt(tx_hash)
+        if receipt is None:
+            return {"ok": False, "motivo": "La transacción no se encontró en la blockchain", "monto_real": 0.0}
+
+        if receipt.status != 1:
+            return {"ok": False, "motivo": "La transacción existe pero falló en la blockchain", "monto_real": 0.0}
+
+        bloque_actual = _w3.eth.block_number
+        confirmaciones = bloque_actual - receipt.blockNumber
+        if confirmaciones < MIN_CONFIRMACIONES:
+            return {"ok": False, "motivo": f"Todavía no tiene suficientes confirmaciones ({confirmaciones}/{MIN_CONFIRMACIONES}). Probá de nuevo en un minuto.", "monto_real": 0.0}
+
+        decimales = _obtener_decimales_usdt()
+        usdt_addr_checksum = Web3.to_checksum_address(USDT_BEP20_ADDR)
+
+        monto_real = 0.0
+        encontrado = False
+        for log in receipt.logs:
+            if log.address.lower() != usdt_addr_checksum.lower():
+                continue
+            if len(log.topics) < 3 or log.topics[0].hex() != TRANSFER_EVENT_TOPIC:
+                continue
+            destino = "0x" + log.topics[2].hex()[-40:]
+            if destino.lower() != POOL_WALLET.lower():
+                continue
+            valor_wei = int(log.data.hex(), 16) if isinstance(log.data, (bytes, bytearray)) else int(log.data, 16)
+            monto_real = valor_wei / (10 ** decimales)
+            encontrado = True
+            break
+
+        if not encontrado:
+            return {"ok": False, "motivo": "La transacción no incluye una transferencia de USDT hacia la wallet del pool", "monto_real": 0.0}
+
+        diferencia_pct = abs(monto_real - monto_declarado) / monto_declarado if monto_declarado > 0 else 1.0
+        if diferencia_pct > TOLERANCIA_MONTO_PCT:
+            return {"ok": False, "motivo": f"El monto declarado (${monto_declarado:.2f}) no coincide con el monto real on-chain (${monto_real:.2f})", "monto_real": monto_real}
+
+        return {"ok": True, "motivo": "Verificado correctamente", "monto_real": monto_real}
+
+    except Exception as e:
+        return {"ok": False, "motivo": f"Error verificando la transacción: {e}", "monto_real": 0.0}
 
 
 # ────────────────────────────────────────────────────────────
@@ -117,6 +204,14 @@ def init_db():
                 ts TEXT NOT NULL
             );
         """)
+        # Restricción de unicidad: el mismo tx_hash no puede registrarse dos veces
+        # (evita que un depósito real se reenvíe varias veces para cobrar de más).
+        # Índice parcial: solo aplica a hashes no nulos.
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_deposits_txhash_unique
+            ON investor_deposits (tx_hash)
+            WHERE tx_hash IS NOT NULL;
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS investor_withdrawals (
                 id SERIAL PRIMARY KEY,
@@ -126,6 +221,10 @@ def init_db():
                 status TEXT NOT NULL DEFAULT 'pending'
             );
         """)
+        # Columnas para poder marcar un retiro como completado con prueba on-chain
+        # (se agregan de forma segura si la tabla ya existía sin ellas).
+        cur.execute("ALTER TABLE investor_withdrawals ADD COLUMN IF NOT EXISTS payout_tx_hash TEXT;")
+        cur.execute("ALTER TABLE investor_withdrawals ADD COLUMN IF NOT EXISTS completed_ts TEXT;")
         cur.close()
 
 
@@ -254,7 +353,7 @@ def cargar_inversor_completo(cur, wallet: str) -> dict:
     cur.execute("SELECT amount, tx_hash, ts FROM investor_deposits WHERE wallet = %s ORDER BY id;", (wallet,))
     inv["deposits"] = [dict(r) for r in cur.fetchall()]
 
-    cur.execute("SELECT amount, ts, status FROM investor_withdrawals WHERE wallet = %s ORDER BY id;", (wallet,))
+    cur.execute("SELECT id, amount, ts, status, payout_tx_hash, completed_ts FROM investor_withdrawals WHERE wallet = %s ORDER BY id;", (wallet,))
     inv["withdraw_requests"] = [dict(r) for r in cur.fetchall()]
 
     return inv
@@ -283,9 +382,33 @@ def deposit(wallet: str, payload: DepositPayload):
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
 
+    if not payload.tx_hash:
+        raise HTTPException(status_code=400, detail="Falta el hash de la transacción (tx_hash)")
+
     wallet = wallet.lower()
+    tx_hash = payload.tx_hash.strip().lower()
     now_iso = datetime.now(timezone.utc).isoformat()
     today = hoy_str()
+
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Rechazar de entrada si este hash ya fue registrado por cualquier wallet
+        cur.execute("SELECT wallet FROM investor_deposits WHERE tx_hash = %s;", (tx_hash,))
+        ya_existe = cur.fetchone()
+        if ya_existe:
+            cur.close()
+            raise HTTPException(status_code=409, detail="Este hash de transacción ya fue registrado anteriormente")
+
+        cur.close()
+
+    # Verificación real en la blockchain de BSC (fuera de la transacción de DB,
+    # ya que puede tardar unos segundos en responder el nodo RPC)
+    verificacion = verificar_deposito_onchain(tx_hash, payload.amount)
+    if not verificacion["ok"]:
+        raise HTTPException(status_code=400, detail=verificacion["motivo"])
+
+    monto_verificado = verificacion["monto_real"]
 
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -301,12 +424,18 @@ def deposit(wallet: str, payload: DepositPayload):
                 joined_at = COALESCE(joined_at, %s),
                 last_accrual_day = %s
             WHERE wallet = %s;
-        """, (payload.amount, now_iso, today, wallet))
+        """, (monto_verificado, now_iso, today, wallet))
 
-        cur.execute("""
-            INSERT INTO investor_deposits (wallet, amount, tx_hash, ts)
-            VALUES (%s, %s, %s, %s);
-        """, (wallet, payload.amount, payload.tx_hash, now_iso))
+        try:
+            cur.execute("""
+                INSERT INTO investor_deposits (wallet, amount, tx_hash, ts)
+                VALUES (%s, %s, %s, %s);
+            """, (wallet, monto_verificado, tx_hash, now_iso))
+        except psycopg2.errors.UniqueViolation:
+            # Carrera improbable: alguien registró el mismo hash en el medio. Abortar limpio.
+            conn.rollback()
+            cur.close()
+            raise HTTPException(status_code=409, detail="Este hash de transacción ya fue registrado (carrera detectada)")
 
         inv = cargar_inversor_completo(cur, wallet)
         cur.close()
@@ -347,7 +476,38 @@ def withdraw(wallet: str):
     return inv
 
 
-@app.post("/api/investors/{wallet}/accrue")
+class CompletarRetiroPayload(BaseModel):
+    payout_tx_hash: str
+
+
+@app.post("/api/investors/{wallet}/withdrawals/{withdrawal_id}/complete")
+def completar_retiro(wallet: str, withdrawal_id: int, payload: CompletarRetiroPayload, x_token: str = Header(default="")):
+    """Vos (admin) marcás un retiro como pagado, adjuntando el hash de la
+    transacción real que enviaste desde tu wallet. El frontend puede
+    entonces mostrarle al inversor una confirmación verificable, en vez
+    de dejarlo con la duda de si el retiro se procesó o no."""
+    if ADMIN_TOKEN and x_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Token invalido")
+
+    wallet = wallet.lower()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            UPDATE investor_withdrawals
+            SET status = 'completed', payout_tx_hash = %s, completed_ts = %s
+            WHERE id = %s AND wallet = %s;
+        """, (payload.payout_tx_hash.strip(), now_iso, withdrawal_id, wallet))
+
+        if cur.rowcount == 0:
+            cur.close()
+            raise HTTPException(status_code=404, detail="No se encontró ese retiro para esa wallet")
+
+        inv = cargar_inversor_completo(cur, wallet)
+        cur.close()
+
+    return inv
 def accrue(wallet: str):
     """Aplica el rendimiento diario del bot a este inversor (una vez por dia)."""
     wallet = wallet.lower()
